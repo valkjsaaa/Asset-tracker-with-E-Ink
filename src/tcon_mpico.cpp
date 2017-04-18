@@ -68,6 +68,16 @@ void TCON_MPICO::getResponse(int le){
     digitalWrite(_ss,HIGH);
 }
 
+static char EPD_HEADER[] =
+{
+  0x33,
+  0x01, 0x90,
+  0x01, 0x2C,
+  0x01,
+  0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+};
+
 void TCON_MPICO::uploadImage(char *buffer){
     waitTCbusy();
     digitalWrite(_ss,LOW);
@@ -75,20 +85,31 @@ void TCON_MPICO::uploadImage(char *buffer){
     MYSPI.transfer(0x01);
     MYSPI.transfer(0x00);
     MYSPI.transfer(0x10);
-    for (int i=0;i<16;i++) MYSPI.transfer(buffer[i]);
+    for (int i=0;i<16;i++) MYSPI.transfer(EPD_HEADER[i]);
     digitalWrite(_ss,HIGH);
     Serial.print("Uploadheader: ");
     getResponse(-1);
 
     waitTCbusy();
-    for (int i=0;i<60;i++){
+    for (int i=0;i<300;i++) {
         waitTCbusy();
         digitalWrite(_ss,LOW);
         MYSPI.transfer(0x20);
         MYSPI.transfer(0x01);
         MYSPI.transfer(0x00);
-        MYSPI.transfer(0xFA);
-        for (int j=0;j<250;j++) MYSPI.transfer(buffer[16+(250*i)+j]);
+        MYSPI.transfer(0x32);
+        for (int j=0;j<50;j++) MYSPI.transfer(buffer[(50*i)+j]);
+        digitalWrite(_ss,HIGH);
+        getResponse(-1);
+    }
+    for (int i=0;i<8;i++) {
+        waitTCbusy();
+        digitalWrite(_ss,LOW);
+        MYSPI.transfer(0x20);
+        MYSPI.transfer(0x01);
+        MYSPI.transfer(0x00);
+        MYSPI.transfer(0xAB);
+        for (int j=0;j<171;j++) MYSPI.transfer(0x00);
         digitalWrite(_ss,HIGH);
         getResponse(-1);
     }

@@ -1,120 +1,116 @@
-/* -----------------------------------------------------------
-This example shows a lot of different features. As configured here
-it will check for a good GPS fix every 10 minutes and publish that data
-if there is one. If not, it will save you data by staying quiet. It also
-registers 3 Particle.functions for changing whether it publishes,
-reading the battery level, and manually requesting a GPS reading.
----------------------------------------------------------------*/
-
-// Getting the library
 #include "AssetTracker.h"
 
-// Set whether you want the device to publish data to the internet by default here.
-// 1 will Particle.publish AND Serial.print, 0 will just Serial.print
-// Extremely useful for saving data while developing close enough to have a cable plugged in.
-// You can also change this remotely using the Particle.function "tmode" defined in setup()
-int transmittingData = 0;
+// Project Location:
 
-// Used to keep track of the last time we published data
-long lastPublish = 0;
 
-// How many minutes between publishes? 10+ recommended for long-time continuous publishing!
-int delayMinutes = 10;
+// System threading is required for this project
+SYSTEM_THREAD(ENABLED);
 
-// Creating an AssetTracker named 't' for us to reference
-AssetTracker t = AssetTracker();
+// Global objects
+FuelGauge batteryMonitor;
+AssetTracker t;
 
-// A FuelGauge named 'fuel' for checking on the battery state
-FuelGauge fuel;
+// This is the name of the Particle event to publish for battery or movement detection events
+// It is a private event.
+const char *eventName = "accel";
 
-// setup() and loop() are both required. setup() runs once when the device starts
-// and is used for registering functions and variables and initializing things
+// Various timing constants
+const unsigned long MAX_TIME_TO_PUBLISH_MS = 60000; // Only stay awake for 60 seconds trying to connect to the cloud and publish
+const unsigned long TIME_AFTER_PUBLISH_MS = 4000; // After publish, wait 4 seconds for data to go out
+const unsigned long TIME_AFTER_BOOT_MS = 5000; // At boot, wait 5 seconds before going to sleep again (after coming online)
+const unsigned long TIME_PUBLISH_BATTERY_SEC = 4 * 60 * 60; // every 4 hours, send a battery update
+
+const uint8_t movementThreshold = 16;
+
+// Stuff for the finite state machine
+enum State { ONLINE_WAIT_STATE, RESET_STATE, RESET_WAIT_STATE, PUBLISH_STATE, SLEEP_STATE, SLEEP_WAIT_STATE, BOOT_WAIT_STATE };
+State state = ONLINE_WAIT_STATE;
+unsigned long stateTime = 0;
+int awake = 0;
+
 void setup() {
-    // Sets up all the necessary AssetTracker bits
-    t.begin();
-
-    // Enable the GPS module. Defaults to off to save power.
-    // Takes 1.5s or so because of delays.
-    t.gpsOn();
-
-    // Opens up a Serial port so you can listen over USB
-    Serial.begin(9600);
-
-    // These three functions are useful for remote diagnostics. Read more below.
-    Particle.function("tmode", transmitMode);
-    Particle.function("batt", batteryStatus);
-    Particle.function("gps", gpsPublish);
+	Serial.begin(9600);
+	t.begin();
 }
 
-// loop() runs continuously
 void loop() {
-    // You'll need to run this every loop to capture the GPS output
-    t.updateGPS();
 
-    // if the current time - the last time we published is greater than your set delay...
-    if (millis()-lastPublish > delayMinutes*1000) {
-        // Remember when we published
-        lastPublish = millis();
+	switch(state) {
+	case ONLINE_WAIT_STATE:
+		if (Particle.connected()) {
+			state = RESET_STATE;
+		}
+		if (millis() - stateTime > 5000) {
+			stateTime = millis();
+			Serial.println("waiting to come online");
+		}
+		break;
 
-        String pubAccel = String::format("%d,%d,%d", t.readX(), t.readY(), t.readZ());
-        Serial.println(pubAccel);
-        Particle.publish("A", pubAccel, 60, PRIVATE);
+	case RESET_STATE:
+		Serial.println("resetting accelerometer");
 
-        // Dumps the full NMEA sentence to serial in case you're curious
-        Serial.println(t.preNMEA());
-        Serial.println(t.readLatLon());
+		if (!t.setupLowPowerWakeMode(movementThreshold)) {
+			Serial.println("accelerometer not found");
+			state = SLEEP_STATE;
+			break;
+		}
 
-        // GPS requires a "fix" on the satellites to give good data,
-        // so we should only publish data if there's a fix
-        if (t.gpsFix()) {
-            // Only publish if we're in transmittingData mode 1;
-            if (transmittingData) {
-                // Short publish names save data!
-                Particle.publish("G", t.readLatLon(), 60, PRIVATE);
-            }
-            // but always report the data over serial for local development
-            /*Serial.println(t.readLatLon());*/
-        }
-    }
-}
+		state = BOOT_WAIT_STATE;
+		break;
 
-// Allows you to remotely change whether a device is publishing to the cloud
-// or is only reporting data over Serial. Saves data when using only Serial!
-// Change the default at the top of the code.
-int transmitMode(String command) {
-    transmittingData = atoi(command);
-    return 1;
-}
+	case PUBLISH_STATE:
+		if (Particle.connected()) {
+			// The publish data contains 3 comma-separated values:
+			// whether movement was detected (1) or not (0) The not detected publish is used for battery status updates
+			// cell voltage (decimal)
+			// state of charge (decimal)
+			char data[32];
+			float cellVoltage = batteryMonitor.getVCell();
+			float stateOfCharge = batteryMonitor.getSoC();
+			snprintf(data, sizeof(data), "%d,%.02f,%.02f", awake, cellVoltage, stateOfCharge);
 
-// Actively ask for a GPS reading if you're impatient. Only publishes if there's
-// a GPS fix, otherwise returns '0'
-int gpsPublish(String command) {
-    if (t.gpsFix()) {
-        Particle.publish("G", t.readLatLon(), 60, PRIVATE);
+			Particle.publish(eventName, data, 60, PRIVATE);
 
-        // uncomment next line if you want a manual publish to reset delay counter
-        // lastPublish = millis();
-        return 1;
-    } else {
-      return 0;
-    }
-}
+			// Wait for the publish to go out
+			stateTime = millis();
+			state = SLEEP_WAIT_STATE;
+		} else {
+			// Haven't come online yet
+			if (millis() - stateTime >= MAX_TIME_TO_PUBLISH_MS) {
+				// Took too long to publish, just go to sleep
+				state = SLEEP_STATE;
+			}
+		}
+		break;
 
-// Lets you remotely check the battery status by calling the function "batt"
-// Triggers a publish with the info (so subscribe or watch the dashboard)
-// and also returns a '1' if there's >10% battery left and a '0' if below
-int batteryStatus(String command){
-    // Publish the battery voltage and percentage of battery remaining
-    // if you want to be really efficient, just report one of these
-    // the String::format("%f.2") part gives us a string to publish,
-    // but with only 2 decimal points to save space
-    Particle.publish("B",
-          "v:" + String::format("%.2f",fuel.getVCell()) +
-          ",c:" + String::format("%.2f",fuel.getSoC()),
-          60, PRIVATE
-    );
-    // if there's more than 10% of the battery left, then return 1
-    if (fuel.getSoC()>10){ return 1;}
-    // if you're running out of battery, return 0
-    else { return 0;}
+	case SLEEP_WAIT_STATE:
+		if (millis() - stateTime >= TIME_AFTER_PUBLISH_MS) {
+			state = SLEEP_STATE;
+		}
+		break;
+
+	case BOOT_WAIT_STATE:
+		if (millis() - stateTime >= TIME_AFTER_BOOT_MS) {
+			// To publish the battery stats after boot, set state to PUBLISH_STATE
+			// To go to sleep immediately, set state to SLEEP_STATE
+			state = PUBLISH_STATE;
+		}
+		break;
+
+	case SLEEP_STATE:
+		// Sleep
+		System.sleep(WKP, RISING, TIME_PUBLISH_BATTERY_SEC, SLEEP_NETWORK_STANDBY);
+
+		// This delay should not be necessary, but sometimes things don't seem to work right
+		// immediately coming out of sleep.
+		delay(500);
+
+		awake = ((t.clearAccelInterrupt() & LIS3DH_INT1_SRC_IA) != 0);
+
+		Serial.printlnf("awake=%d", awake);
+
+		state = PUBLISH_STATE;
+		stateTime = millis();
+		break;
+	}
 }
